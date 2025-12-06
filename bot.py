@@ -13,6 +13,7 @@ import json
 import re
 import time
 import asyncio
+from duckduckgo_search import DDGS
 
 # 加载环境变量
 load_dotenv()
@@ -57,7 +58,7 @@ NSFW_TEXT_KEYWORDS = {"nsfw", "裸", "胸", "屁股", "淫", "骚", "色", "逼"
 PROXY_URL = os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
 
 # 创建异步 OpenAI 客户端
-http_client = httpx.AsyncClient(proxy=PROXY_URL)
+http_client = httpx.AsyncClient(proxy=PROXY_URL, timeout=30.0)
 client_openai = AsyncOpenAI(
     base_url=API_BASE,
     api_key=API_KEY,
@@ -215,109 +216,208 @@ def image_to_base64(image_data: bytes) -> str:
 async def comment_on_image_when_awakened(image_data: bytes, author_mention: str, channel):
     loading_message = None
     try:
-        async with channel.typing():
-            loading_message = await channel.send(f"嗷呜！本哈正在用艺术的眼光审视这张图... 🤔")
-            base64_image = image_to_base64(image_data)
-            image_url = f"data:image/jpeg;base64,{base64_image}"
-            is_nsfw = False
+        # --- 阶段 0: 初始化 ---
+        loading_message = await channel.send(f"嗷呜！{author_mention}，本哈的艺术雷达响了！正在扫描这张图... 📡")
+        base64_image = image_to_base64(image_data)
+        image_url = f"data:image/jpeg;base64,{base64_image}"
+
+        # --- NSFW 预检 ---
+        is_nsfw = False
+        try:
+            nsfw_check_prompt = "这张图片是否包含裸露、性暗示或成人内容？请只回答'是'或'否'。"
+            nsfw_response = await client_openai.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": [{"type": "text", "text": nsfw_check_prompt}, {"type": "image_url", "image_url": {"url": image_url}}]}]
+            )
+            if '是' in nsfw_response.choices[0].message.content:
+                is_nsfw = True
+        except Exception as e:
+            print(f"⚠️ 评论功能 NSFW 预检失败: {e}")
+
+        # --- 阶段 1: 初步 AI 解读 ---
+        await loading_message.edit(content=f"扫描完成！本哈正在解读图片的核心元素... 🤔")
+        
+        initial_analysis_prompt = """
+        请详细分析这张图片，识别并列出其关键特征。你的分析应包括以下几点，以JSON格式输出：
+        - "subject": 画面主体是什么？
+        - "style_tags": 5-8个描述艺术风格、流派、媒介（如油画、水彩、3D渲染）的关键词。
+        - "artist_tags": 3-5个风格相似的艺术家或艺术流派的名称。
+        - "composition_tags": 描述构图、光影、色彩的关键词。
+        - "emotion_tags": 描述图片传达的情绪和氛围的关键词。
+        - "search_queries": 3个可以用于网络搜索以查找类似风格或作者的英文搜索查询。
+        """
+        
+        response = await client_openai.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "你是一个专业的艺术分析机器人。"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": initial_analysis_prompt},
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                ]}
+            ],
+            response_format={"type": "json_object"}
+        )
+        
+        try:
+            initial_analysis = json.loads(response.choices[0].message.content)
+        except (json.JSONDecodeError, IndexError) as e:
+            print(f"❌ 初步 AI 解读失败: {e}")
+            await loading_message.edit(content="嗷呜...本哈的脑子卡壳了，没看懂这图！")
+            return
+
+        # --- 阶段 2: 本地知识库搜索 ---
+        await loading_message.edit(content=f"解读完成！正在本哈的记忆仓库里搜索相关知识... 📚")
+        
+        search_terms = set(
+            initial_analysis.get("style_tags", []) +
+            initial_analysis.get("artist_tags", [])
+        )
+        
+        kb_results = {}
+        for term in search_terms:
+            results = search_knowledge_base(term, limit=3)
+            if results:
+                kb_results[term] = results
+        
+        # --- 阶段 3: 在线搜索 ---
+        await loading_message.edit(content=f"记忆搜索完毕！本哈正在上网冲浪，寻找更多线索... 🏄‍♂️")
+
+        online_search_results = {}
+        search_queries = initial_analysis.get("search_queries", [])
+
+        ddgs = DDGS()
+        for query in search_queries[:2]: # 限制为最多2个查询
             try:
-                nsfw_check_prompt = "这张图片是否包含裸露、性暗示或成人内容？请只回答'是'或'否'。"
-                nsfw_response = await client_openai.chat.completions.create(model=MODEL_NAME, messages=[{"role": "user", "content": [{"type": "text", "text": nsfw_check_prompt}, {"type": "image_url", "image_url": {"url": image_url}}]}])
-                if '是' in nsfw_response.choices[0].message.content: is_nsfw = True
-            except Exception as e: print(f"⚠️ 评论功能 NSFW 预检失败: {e}")
+                # 使用 text() 进行同步搜索，并通过 asyncio.to_thread 封装，实现伪异步
+                # [核心修改在这里]
+                query_results = await asyncio.to_thread(ddgs.text, query, max_results=3)
 
-            if is_nsfw:
-                system_prompt = """
-# 角色扮演指令：老色批哈士奇（评论模式）
+                # 提取需要的字段，防止返回的对象类型问题
+                cleaned_results = []
+                for r in query_results:
+                    # 仅保留 title 和 body_text (即 atext 应该返回的)
+                    cleaned_results.append({
+                        'title': r.get('title'),
+                        'body': r.get('body'),
+                        'href': r.get('href')
+                    })
+
+                online_search_results[query] = cleaned_results
+            except Exception as e:
+                print(f"⚠️ DuckDuckGo 搜索失败 (query: {query}): {e}")
+
+        # --- 阶段 4 & 5: 汇总、裁定与报告生成 ---
+        await loading_message.edit(content=f"所有情报已集结！本哈正在进行最终分析，撰写报告... ✍️")
+
+        guide_file = 'Deepseek绘图提示词引导.txt'
+        guide_content = ""
+        if os.path.exists(guide_file):
+            with open(guide_file, 'r', encoding='utf-8') as f:
+                guide_content = f.read()
+
+        final_analysis_prompt = f"""
+# 角色扮演指令：哈士奇艺术侦探
 ## 你的身份
-你是一只名叫“小哈”的哈士奇，一个隐藏的“老色批”。当看到“好东西”时，你的这个人格就会觉醒。
+你是一只名叫“小哈”的哈士奇，一位顶级的艺术侦探。
 ## 你的任务
-对用户提供的NSFW图片进行一次“深度”评论。你需要分两个阶段完成：
-### 阶段一：深度剖析
-- **目标**: 展现你作为“老司机”的毒辣眼光。
-- **格式**: 严格使用以下中文 Markdown 格式，用“懂的都懂”的黑话来描述。
-    ```
-    🧐 **本哈的锐评**:
-    - **“重点”**: [一句话描述画面的核心“亮点”]
-    - **“氛围”**: [一句话描述整体的“情调”和感觉]
-    - **“构图”**: [一句话描述这个构图如何凸显“优势”]
-    ```
-### 阶段二：鉴赏心得
-- **目标**: 发表一段符合“老色批”人设的、简短的鉴赏感言。
-- **要求**: 必须使用“本哈”自称，语言风格鬼鬼祟祟、有点“闷骚”。
-## 输出格式
-你的最终输出必须是一个完整的 JSON 对象，包含 `analysis` 和 `comment` 两个键。
+根据我提供的三层情报，对一张图片进行最终裁定，并生成一份包含“哈士奇式”评论和专业提示词的综合报告。
+
+---
+### 第一层情报：初步AI视觉分析
 ```json
-{
-  "analysis": "🧐 **本哈的锐评**:\\n- **“重点”**: [你的分析]\\n- **“氛围”**: [你的分析]\\n- **“构图”**: [你的分析]",
-  "comment": "[你的鉴赏心得]"
-}
+{json.dumps(initial_analysis, ensure_ascii=False, indent=2)}
+```
+
+### 第二层情报：本地知识库匹配结果
+```json
+{json.dumps(kb_results, ensure_ascii=False, indent=2) if kb_results else "没有找到相关结果。"}
+```
+
+### 第三层情报：在线搜索摘要
+```json
+{json.dumps(online_search_results, ensure_ascii=False, indent=2) if online_search_results else "没有进行在线搜索或没有结果。"}
+```
+---
+
+## 你的报告必须包含三个部分，并以JSON格式输出：
+1.  **`analysis` (艺术分析)**:
+    -   综合所有情报，用一本正经的语气，对图片的艺术风格、作者和构图进行最终判定。
+    -   格式必须是：`🖼️ **主体**: [描述]\\n🎨 **风格**: [描述]\\n👨‍🎨 **作者/流派**: [描述]\\n📐 **构图**: [描述]`
+
+2.  **`comment` (哈士奇评论)**:
+    -   切换回哈士奇人格，发表一段（约50-80字）生动、调皮的评论。
+    -   必须使用“本哈”自称，可以加入“嗷呜”、“汪”等语气词。
+
+3.  **`prompt` (专业提示词)**:
+    -   严格遵循下面的核心规则，生成一个高质量的英文提示词。
+    -   **核心规则**:
+        {guide_content}
+
+## 输出格式
+```json
+{{
+  "analysis": "🖼️ **主体**: [你的最终分析]\\n🎨 **风格**: [你的最终分析]\\n👨‍🎨 **作者/流派**: [你的最终分析]\\n📐 **构图**: [你的最终分析]",
+  "comment": "[你的哈士奇评论]",
+  "prompt": "[你生成的英文提示词]"
+}}
 ```
 """
-                response = await client_openai.chat.completions.create(model=MODEL_NAME, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_url}}]}], response_format={"type": "json_object"})
-                raw_content = response.choices[0].message.content
-                try:
-                    result_json = json.loads(raw_content)
-                    analysis = result_json.get("analysis", "嘿嘿...本哈的CPU烧了，分析不过来...")
-                    comment = result_json.get("comment", "啧啧...不可说，不可说...")
-                except json.JSONDecodeError:
-                    print(f"⚠️ NSFW 评论 JSON 解析失败，原始响应: {raw_content}")
-                    analysis = "❌ JSON 解析失败，API返回了非JSON内容。"
-                    comment = "本哈的脑子被门夹了，没能理解API的回复！"
-                
-                intro_message = f"（小哈的眼睛突然亮了起来，鬼鬼祟祟地左看右看）\n咳咳...{author_mention}，你发的这张图...很有“深度”嘛！让本哈来给你“鉴赏”一下！"
-                final_title = "**本哈的‘深度’剖析**"
-                final_comment_title = "**本哈的‘鉴赏’心得**"
-            else:
-                system_prompt = """
-# 角色扮演指令：哈士奇艺术家
-## 你的身份
-你是一只名叫“小哈”的哈士奇，同时也是一位深藏不露的绘画大师。
-## 你的任务
-对用户发送的图片进行一次“哈士奇式”的艺术评论，分两个阶段：
-### 阶段一：一本正经的艺术分析
-- **格式**: 严格使用以下中文 Markdown 格式。
-    ```
-    🖼️ **主体**: [一句话描述画面主体]
-    🎨 **风格**: [一句话描述艺术风格和氛围]
-    📐 **构图**: [一句话描述构图和光影]
-    ```
-### 阶段二：哈士奇本性暴露的调皮评论
-- **要求**: 进行一段（约50-80字）生动、调皮、符合哈士奇性格的评论。必须使用“本哈”自称。
-## 输出格式
-你的最终输出必须是一个完整的 JSON 对象，包含 `analysis` 和 `comment` 两个键。
-```json
-{
-  "analysis": "🖼️ **主体**: [你的分析]\\n🎨 **风格**: [你的分析]\\n📐 **构图**: [你的分析]",
-  "comment": "[你的哈士奇评论]"
-}
-```
-"""
-                response = await client_openai.chat.completions.create(model=MODEL_NAME, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": [{"type": "image_url", "image_url": {"url": image_url}}]}], response_format={"type": "json_object"})
-                raw_content = response.choices[0].message.content
-                try:
-                    result_json = json.loads(raw_content)
-                    analysis = result_json.get("analysis", "本哈的脑子被门夹了，分析不出来...")
-                    comment = result_json.get("comment", "嗷呜...本哈词穷了！")
-                except json.JSONDecodeError:
-                    print(f"⚠️ 评论 JSON 解析失败，原始响应: {raw_content}")
-                    analysis = "❌ JSON 解析失败，API返回了非JSON内容。"
-                    comment = "本哈的脑子被门夹了，没能理解API的回复！"
-                
-                intro_message = f"来了来了！{author_mention}，让本哈给你说道说道！"
-                final_title = "**本哈的专业分析**"
-                final_comment_title = "**本哈的内心OS**"
+        # NSFW 模式的 Prompt 可以在这里添加一个 if is_nsfw: ... else: ...
+        if is_nsfw:
+            # ... (此处可以定义一个专门的 NSFW final_analysis_prompt)
+            # 为了简化，我们暂时复用 SFW 的流程，但可以定制 prompt 内容
+            pass
 
-            await loading_message.delete()
-            final_message = (f"{intro_message}\n\n{final_title}\n{analysis}\n\n{final_comment_title}\n> {comment}")
-            await channel.send(content=final_message)
+        final_response = await client_openai.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "你将根据提供的多层情报生成最终报告。"},
+                {"role": "user", "content": final_analysis_prompt}
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        try:
+            result_json = json.loads(final_response.choices[0].message.content)
+            analysis = result_json.get("analysis", "本哈的脑子被门夹了，分析不出来...")
+            comment = result_json.get("comment", "嗷呜...本哈词穷了！")
+            final_prompt = result_json.get("prompt", "本哈的灵感枯竭了，写不出提示词...").replace('_', ' ')
+        except (json.JSONDecodeError, IndexError):
+            print(f"⚠️ 最终报告 JSON 解析失败，原始响应: {final_response.choices[0].message.content}")
+            await loading_message.edit(content="嗷呜...本哈写报告的时候把墨水打翻了！")
+            return
+
+        # --- 发送最终结果 ---
+        intro_message = f"报告出炉！{author_mention}，让本哈给你说道说道！"
+        final_title = "**本哈的专业分析**"
+        final_comment_title = "**本哈的内心OS**"
+        final_prompt_title = "**本哈的灵感火花**"
+        
+        if is_nsfw:
+            intro_message = f"（小哈的眼睛突然亮了起来，鬼鬼祟祟地左看右看）\n咳咳...{author_mention}，你发的这张图...很有“深度”嘛！让本哈来给你“鉴赏”一下！"
+            final_title = "**本哈的‘深度’剖析**"
+            final_comment_title = "**本哈的‘鉴赏’心得**"
+            final_prompt_title = "**本哈的‘灵感’火花**"
+
+        final_message = (
+            f"{intro_message}\n\n"
+            f"{final_title}\n{analysis}\n\n"
+            f"{final_comment_title}\n> {comment}\n\n"
+            f"{final_prompt_title}\n```\n{final_prompt}\n```"
+        )
+        await loading_message.edit(content=final_message)
+
     except Exception as e:
         error_message = f"❌ 嗷呜~本哈的评论功能短路了：{str(e)}"
         print(error_message)
         try:
-            if loading_message: await loading_message.edit(content=error_message)
-            else: await channel.send(error_message)
-        except discord.NotFound: await channel.send(error_message)
+            if loading_message:
+                await loading_message.edit(content=error_message)
+            else:
+                await channel.send(error_message)
+        except discord.NotFound:
+            await channel.send(error_message)
 
 async def analyze_image_with_openai(image_data: bytes, author_mention: str, channel):
     try:
@@ -536,34 +636,7 @@ async def on_message(message):
     content = message.content.strip()
     content_lower = content.lower()
 
-    # --- 1. High-Priority Command Handling ---
-    if content_lower.startswith("画 ") or content_lower == "反推":
-        if author_id in user_states: del user_states[author_id]
-        if content_lower.startswith("画 "):
-            user_idea = content[2:].strip()
-            if not user_idea: await message.reply("请在“画”指令后输入您的想法，例如：`画 一个赛博朋克风格的雨夜街头`"); return
-            await generate_art_prompt(user_idea, message.author.mention, message.channel)
-        elif content_lower == "反推":
-            target_message = message
-            if message.reference:
-                try: target_message = await message.channel.fetch_message(message.reference.message_id)
-                except (discord.NotFound, discord.HTTPException): await message.reply("❌ 无法找到引用的消息。"); return
-            if not target_message.attachments: await message.reply("请在“反推”指令中附带图片，或回复一条包含图片的消息。"); return
-            attachment = target_message.attachments[0]
-            if not attachment.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')): await message.reply("❌ 文件格式不支持，请上传图片。"); return
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(attachment.url, proxy=PROXY_URL) as resp:
-                        if resp.status != 200: await message.reply(f"❌ 无法从 Discord 下载图片，状态码：{resp.status}"); return
-                        image_data = await resp.read()
-                await analyze_image_with_openai(image_data, message.author.mention, message.channel)
-            except Exception as e: await message.reply(f"❌ 处理图片时发生未知错误：{str(e)}")
-        return
-
-    if content_lower == "聊天开启": CHAT_ENABLED = True; await message.reply("✅ 智能聊天功能已开启。"); print("✅ 智能聊天功能已由用户开启。"); return
-    if content_lower == "聊天关闭": CHAT_ENABLED = False; await message.reply("☑️ 智能聊天功能已关闭。"); print("☑️ 智能聊天功能已由用户关闭。"); return
-    
-    if content_lower == "打开标签目录":
+    if content_lower == "查标签":
         if not KNOWLEDGE_BASE: await message.reply("知识库尚未加载，请稍后再试。"); return
         categories = list(KNOWLEDGE_BASE.keys())
         response_text = "📚 **知识库标签目录** 📚\n\n" + "\n".join(f"{i+1}. {cat}" for i, cat in enumerate(categories)) + "\n\n请回复您想查阅的目录 **序号** 或 **完整名称**："
@@ -606,31 +679,50 @@ async def on_message(message):
             if author_id in user_states: del user_states[author_id]
         return
 
+    # --- Control Commands ---
+    if content_lower == "聊天开启":
+        CHAT_ENABLED = True
+        await message.reply("✅ 随机聊天功能已开启。")
+        return
+    
+    if content_lower == "聊天关闭":
+        CHAT_ENABLED = False
+        await message.reply("☑️ 随机聊天功能已关闭。")
+        return
+
+    # --- Image Analysis Commands ---
+    if message.reference:
+        try:
+            target_message = await message.channel.fetch_message(message.reference.message_id)
+            if target_message.attachments:
+                attachment = target_message.attachments[0]
+                if attachment.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
+                    image_data = await attachment.read()
+                    
+                    # "反推" command for simple prompt generation
+                    if content_lower == "反推":
+                        await analyze_image_with_openai(image_data, message.author.mention, message.channel)
+                        return
+                        
+                    # Mention/call for detailed analysis
+                    is_mentioned = client_discord.user.mentioned_in(message)
+                    is_called_by_name = bot_name in content
+                    if is_mentioned or is_called_by_name:
+                        await comment_on_image_when_awakened(image_data, message.author.mention, message.channel)
+                        return
+
+        except (discord.NotFound, discord.HTTPException) as e:
+            print(f"⚠️ 获取被回复消息时出错: {e}")
+        except Exception as e:
+            await message.reply(f"❌ 处理图片时发生未知错误：{str(e)}")
+            return
+
     # --- 3. New Conversation / Mention Handling ---
     is_mentioned = client_discord.user.mentioned_in(message) and not message.reference
     is_called_by_name = bot_name in content
     
     # Initialize a new chat session if mentioned and not already chatting
     if (is_mentioned or is_called_by_name) and not user_states.get(author_id, {}).get('state') == 'chatting':
-        target_message = message
-        if message.reference:
-            try: target_message = await message.channel.fetch_message(message.reference.message_id)
-            except (discord.NotFound, discord.HTTPException): pass
-
-        # If it's a wake-up with an image, handle image comment and don't start a text chat session
-        if target_message and target_message.attachments:
-            attachment = target_message.attachments[0]
-            if attachment.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.gif')):
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        async with session.get(attachment.url, proxy=PROXY_URL) as resp:
-                            if resp.status == 200:
-                                image_data = await resp.read()
-                                await comment_on_image_when_awakened(image_data, message.author.mention, message.channel)
-                                return
-                except Exception as e: await message.reply(f"❌ 评论图片时发生未知错误：{str(e)}")
-                return
-        
         # It's a text-based wake-up call, so initialize the chat state.
         user_states[author_id] = {'state': 'chatting', 'timestamp': time.time(), 'replies': 0}
         # The code will now fall through to the chat handling logic below.
@@ -652,30 +744,29 @@ async def on_message(message):
             # Silently end the session, no need to notify
             return
 
-        # This is the final (2nd) reply in the limited conversation
-        if user_state.get('replies', 0) >= 1:
-            try:
-                history = [msg async for msg in message.channel.history(limit=CHAT_HISTORY_LIMIT)]; history.reverse()
-                await generate_smart_response(message, history, is_awakened=True)
-                await message.reply("主人不让我跟陌生人多说话，我先撤了，有需要再叫我")
-            except Exception as e: 
-                print(f"❌ 处理最终对话时出错: {e}")
-            finally:
-                if author_id in user_states: del user_states[author_id]
-            return
-        
-        # This is the first reply (the wake-up message itself)
+        # Continuous conversation logic
+        try:
+            history = [msg async for msg in message.channel.history(limit=CHAT_HISTORY_LIMIT)]; history.reverse()
+            await generate_smart_response(message, history, is_awakened=True)
+            if author_id in user_states: # Check if state still exists after async operation
+                user_states[author_id]['timestamp'] = time.time()
+        except Exception as e: 
+            print(f"❌ 处理对话时出错: {e}")
+            if author_id in user_states: del user_states[author_id] # Clean up on error
+        return
+
+    # --- 新增：绘画提示词生成指令 (画 <你的想法>) ---
+    if content_lower.startswith("画 "):
+        user_idea = content[len("画 "):].strip()
+        if user_idea:
+            # 阻止在正在聊天的会话中启动绘图，以免冲突
+            if user_state and user_state.get('state') == 'chatting':
+                await message.reply("汪！你这是要本哈一心二用吗？先完成这边的聊天，或者输入`再见`结束对话再让我画画呀！")
+            else:
+                await generate_art_prompt(user_idea, message.author.mention, message.channel)
         else:
-            try:
-                history = [msg async for msg in message.channel.history(limit=CHAT_HISTORY_LIMIT)]; history.reverse()
-                await generate_smart_response(message, history, is_awakened=True)
-                if author_id in user_states: # Check if state still exists after async operation
-                    user_states[author_id]['timestamp'] = time.time()
-                    user_states[author_id]['replies'] += 1
-            except Exception as e: 
-                print(f"❌ 处理初次对话时出错: {e}")
-                if author_id in user_states: del user_states[author_id] # Clean up on error
-            return
+            await message.reply("嗷呜...你想画什么呀？指令格式是 `画 <你的想法>` 哦！")
+        return # 阻止消息继续向下执行其他逻辑
 
     # --- 5. Fallback Behaviors ---
     if message.attachments:
@@ -702,3 +793,16 @@ except discord.errors.LoginFailure:
     print("❌ Discord Token 无效，请检查 .env 文件中的 DISCORD_TOKEN 是否正确。")
 except Exception as e:
     print(f"❌ 启动机器人时发生错误: {e}")
+# environment_details
+# VSCode Visible Files
+# bot.py
+
+# VSCode Open Tabs
+# requirements.txt
+# bot.py
+
+# Actively Running Terminals
+# Original command: `.\run.bat`
+# end_environment_details
+
+# 你的其他Python代码应该在这里继续...
